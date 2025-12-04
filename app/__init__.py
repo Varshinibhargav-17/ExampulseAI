@@ -21,6 +21,7 @@ def create_app():
     # initialize extensions
     socketio.init_app(app)
     db.init_app(app)
+    from .sockets import handlers
 
     # Root health-check
     @app.route("/")
