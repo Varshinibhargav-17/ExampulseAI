@@ -1,41 +1,46 @@
-import os
+
 from flask import Flask
 from flask_socketio import SocketIO
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
+from dotenv import load_dotenv
+import os
 
-# Extensions (constructed without app)
-socketio = SocketIO(cors_allowed_origins="*", async_mode="eventlet")
+# Load .env file
+load_dotenv()
+
+# allow the Vite dev origin explicitly
+ALLOWED_ORIGINS = ["http://localhost:5174", "http://localhost:3000"]
+
+socketio = SocketIO(cors_allowed_origins=ALLOWED_ORIGINS)
 db = SQLAlchemy()
 
 def create_app():
     app = Flask(__name__)
-
-    # Configuration (Postgres expected)
     app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
-    app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv(
-        "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/exampulse"
-    )
+    
+    # Use SQLite for development if DATABASE_URL is not set
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        database_url = "sqlite:///exampulseai.db"
+    
+    app.config["SQLALCHEMY_DATABASE_URI"] = database_url
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
     # initialize extensions
+    CORS(app, origins=ALLOWED_ORIGINS)
     socketio.init_app(app)
     db.init_app(app)
-    from .sockets import handlers
+    
+    
 
-    # Root health-check
-    @app.route("/")
-    def index():
-        return "ExamPulse backend running"
+    # register blueprints etc...
+    from .routes.baselines import baselines_bp
+    from .routes.features import features_bp
+    app.register_blueprint(baselines_bp, url_prefix="/api/baselines")
+    app.register_blueprint(features_bp, url_prefix="/api/features")
 
-    # simple connectivity test socket
-    @socketio.on("ping")
-    def on_ping(data):
-        print("received ping:", data)
-        socketio.emit("pong", {"msg": "pong from server"})
-
-    # Register routes (users blueprint - dev-only minimal endpoints)
-    from .routes.users import users_bp
-    app.register_blueprint(users_bp, url_prefix="/api/users")
+    # ensure socket handlers are imported
+    from .sockets import handlers  # noqa: F401
 
     return app
