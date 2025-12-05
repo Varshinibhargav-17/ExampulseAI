@@ -1,12 +1,37 @@
-venv/
-__pycache__/
-*.pyc
-.env
-.env.local
+# Dependencies
 node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+.venv/
+
+# IDEs
 .vscode/
 .idea/
-*.log
+
+# Build outputs
+dist/
+build/
+
+# System
 .DS_Store
-backend/venv/
-backend/.env
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database
+*.db
+*.sqlite3
+
+# Environment variables
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local

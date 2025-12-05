@@ -1,95 +1,130 @@
-from flask import Blueprint, request, jsonify, current_app
-from .. import db
-from ..models import Baseline
-from ..services.baseline_utils import merge_baseline
+# app/routes/baselines.py
+from flask import Blueprint, request, jsonify
+from app import db
+from app.models import Baseline, User
+import json
+import jwt
+import os
+from datetime import datetime
 
-baselines_bp = Blueprint("baselines", __name__)
+baselines_bp = Blueprint('baselines', __name__)
 
-@baselines_bp.route("/", methods=["GET"])
-def list_baselines():
-    items = Baseline.query.order_by(Baseline.id.asc()).all()
-    out = []
-    for b in items:
-        out.append({
-            "id": b.id,
-            "user_id": b.user_id,
-            "features": b.features,
-            "sample_count": b.sample_count,
-            "created_at": b.created_at.isoformat(),
-            "updated_at": b.updated_at.isoformat() if b.updated_at else None
-        })
-    return jsonify(out), 200
+SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
 
-
-@baselines_bp.route("/<int:user_id>", methods=["GET"])
-def get_baseline(user_id):
-    b = Baseline.query.filter_by(user_id=user_id).first()
-    if not b:
-        return jsonify({"error": "baseline-not-found"}), 404
-    return jsonify({
-        "id": b.id,
-        "user_id": b.user_id,
-        "features": b.features,
-        "sample_count": b.sample_count,
-        "created_at": b.created_at.isoformat(),
-        "updated_at": b.updated_at.isoformat() if b.updated_at else None
-    }), 200
-
-
-@baselines_bp.route("/create", methods=["POST"])
-def create_baseline():
-    """
-    Create a baseline.
-    Expected JSON:
-    {
-      "user_id": 123,
-      "features": { "wpm_mean": 45.2, "tab_switch_rate": 0.02, "mouse_speed_mean": 120.5 }
-    }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    user_id = data.get("user_id")
-    features = data.get("features")
-    if user_id is None or features is None:
-        return jsonify({"error": "user_id and features required"}), 400
-
-    if Baseline.query.filter_by(user_id=user_id).first():
-        return jsonify({"error": "baseline-already-exists"}), 400
-
-    b = Baseline(user_id=user_id, features=features, sample_count=1)
-    db.session.add(b)
-    db.session.commit()
-    return jsonify({"id": b.id, "user_id": b.user_id}), 201
-
-
-@baselines_bp.route("/<int:user_id>/merge", methods=["POST"])
-def merge_sample_into_baseline(user_id):
-    """
-    Merge a new sample (from a practice test) into an existing baseline using incremental averaging.
-    Expected JSON:
-    {
-      "features": { "wpm_mean": 50.0, "tab_switch_rate": 0.01, ... }
-    }
-    """
-    data = request.get_json(force=True, silent=True) or {}
-    new_features = data.get("features")
-    if new_features is None:
-        return jsonify({"error": "features required"}), 400
-
-    b = Baseline.query.filter_by(user_id=user_id).first()
-    if not b:
-        # if no baseline exists, create one
-        b = Baseline(user_id=user_id, features=new_features, sample_count=1)
-        db.session.add(b)
-        db.session.commit()
-        return jsonify({"status": "created", "id": b.id}), 201
-
+def get_user_from_token():
+    """Extract user from JWT token"""
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        return None
     try:
-        merged_features = merge_baseline(b.features, new_features, b.sample_count)
-        b.features = merged_features
-        b.sample_count = b.sample_count + 1
-        db.session.add(b)
+        token = auth_header.split(' ')[1]
+        payload = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+        return User.query.get(payload['user_id'])
+    except:
+        return None
+
+
+@baselines_bp.route('/', methods=['POST'])
+def create_baseline():
+    """Create or update user baseline"""
+    try:
+        user = get_user_from_token()
+        if not user:
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        data = request.get_json()
+        
+        # Check if baseline exists
+        baseline = Baseline.query.filter_by(user_id=user.id).first()
+        
+        if baseline:
+            # Update existing baseline
+            baseline.sample_count += 1
+            baseline.updated_at = datetime.utcnow()
+            
+            # Update features (merge with existing)
+            existing_features = json.loads(baseline.features) if baseline.features else {}
+            new_features = data.get('features', {})
+            
+            # Average the values
+            for key, value in new_features.items():
+                if key in existing_features:
+                    existing_features[key] = (existing_features[key] + value) / 2
+                else:
+                    existing_features[key] = value
+            
+            baseline.features = json.dumps(existing_features)
+            
+            # Update specific metrics
+            if data.get('typing_speed_wpm'):
+                baseline.typing_speed_wpm = (baseline.typing_speed_wpm + data['typing_speed_wpm']) / 2 if baseline.typing_speed_wpm else data['typing_speed_wpm']
+            if data.get('mouse_speed_pxs'):
+                baseline.mouse_speed_pxs = (baseline.mouse_speed_pxs + data['mouse_speed_pxs']) / 2 if baseline.mouse_speed_pxs else data['mouse_speed_pxs']
+            if data.get('avg_question_time_sec'):
+                baseline.avg_question_time_sec = (baseline.avg_question_time_sec + data['avg_question_time_sec']) / 2 if baseline.avg_question_time_sec else data['avg_question_time_sec']
+            if data.get('tab_switch_rate'):
+                baseline.tab_switch_rate = (baseline.tab_switch_rate + data['tab_switch_rate']) / 2 if baseline.tab_switch_rate else data['tab_switch_rate']
+            
+            message = 'Baseline updated successfully'
+        else:
+            # Create new baseline
+            baseline = Baseline(
+                user_id=user.id,
+                features=json.dumps(data.get('features', {})),
+                sample_count=1,
+                typing_speed_wpm=data.get('typing_speed_wpm'),
+                mouse_speed_pxs=data.get('mouse_speed_pxs'),
+                avg_question_time_sec=data.get('avg_question_time_sec'),
+                tab_switch_rate=data.get('tab_switch_rate', 0.0)
+            )
+            db.session.add(baseline)
+            message = 'Baseline created successfully'
+        
         db.session.commit()
-        return jsonify({"status": "merged", "id": b.id, "sample_count": b.sample_count}), 200
+        
+        return jsonify({
+            'message': message,
+            'baseline': baseline.to_dict()
+        }), 201 if not baseline.sample_count > 1 else 200
+        
     except Exception as e:
-        current_app.logger.exception("merge error")
-        return jsonify({"error": "merge-failed", "details": str(e)}), 500
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+
+@baselines_bp.route('/', methods=['GET'])
+def get_baseline():
+    """Get user's baseline"""
+    try:
+        user = get_user_from_token()
+        if not user:
+            return jsonify({'error': 'Unauthorized'}), 401
+        
+        baseline = Baseline.query.filter_by(user_id=user.id).first()
+        
+        if not baseline:
+            return jsonify({'error': 'No baseline found'}), 404
+        
+        return jsonify({'baseline': baseline.to_dict()}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@baselines_bp.route('/<int:user_id>', methods=['GET'])
+def get_user_baseline(user_id):
+    """Get baseline for specific user (proctor only)"""
+    try:
+        user = get_user_from_token()
+        if not user or user.role != 'proctor':
+            return jsonify({'error': 'Unauthorized - Proctor access required'}), 403
+        
+        baseline = Baseline.query.filter_by(user_id=user_id).first()
+        
+        if not baseline:
+            return jsonify({'error': 'No baseline found for this user'}), 404
+        
+        return jsonify({'baseline': baseline.to_dict()}), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500

@@ -3,9 +3,9 @@ import { io } from "socket.io-client";
 
 const WS_BASE = import.meta.env.VITE_WS_URL || "http://localhost:5000";
 
-// single shared socket instance
+// single shared socket instance for the whole app
 export const socket = io(WS_BASE, {
-  transports: ["websocket","polling"],
+  transports: ["websocket", "polling"],
   autoConnect: true,
   reconnectionAttempts: 3
 });

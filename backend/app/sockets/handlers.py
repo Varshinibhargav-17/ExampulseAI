@@ -1,91 +1,319 @@
 # app/sockets/handlers.py
-from flask import current_app
+"""
+Socket.IO event handlers for real-time exam monitoring
+"""
+from flask import request
+from flask_socketio import emit, join_room, leave_room
 from app import socketio, db
-from app.models import Event, Alert, Baseline
-from app.services.risk_engine import compute_risk_score
-from flask_socketio import join_room, leave_room
-import traceback
+from app.models import ExamSession, Event, Alert, Baseline
+from app.services.risk_scorer import risk_scorer
+from datetime import datetime
+import json
 
-# client emits: socket.emit("join_exam", {"user_id": 1, "exam_id": 10, "role": "student"/"proctor"})
-@socketio.on("join_exam")
-def handle_join(data):
+# Store active connections
+active_sessions = {}  # {session_id: {user_id, exam_id, socket_id}}
+
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    print(f"Client connected: {request.sid}")
+    emit('connected', {'message': 'Connected to ExamPulse AI'})
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    print(f"Client disconnected: {request.sid}")
+    
+    # Remove from active sessions
+    for session_id, data in list(active_sessions.items()):
+        if data.get('socket_id') == request.sid:
+            del active_sessions[session_id]
+            break
+
+
+@socketio.on('join_exam')
+def handle_join_exam(data):
+    """
+    Student or proctor joins an exam room
+    
+    Data: {user_id, exam_id, role}
+    """
     try:
-        user_id = data.get("user_id")
-        exam_id = data.get("exam_id")
-        role = data.get("role", "student")
+        user_id = data.get('user_id')
+        exam_id = data.get('exam_id')
+        role = data.get('role', 'student')
+        
         if not user_id or not exam_id:
-            socketio.emit("joined", {"status": "error", "reason": "missing user_id or exam_id"})
+            emit('error', {'message': 'Missing user_id or exam_id'})
             return
-        # room naming: per-exam proctors, per-exam-user
-        user_room = f"exam_{exam_id}_user_{user_id}"
-        proctor_room = f"exam_{exam_id}_proctors"
-        join_room(user_room)
-        if role == "proctor":
-            join_room(proctor_room)
-        socketio.emit("joined", {"status": "ok", "user_room": user_room, "proctor_room": proctor_room})
-    except Exception:
-        current_app.logger.exception("join_exam error")
-        socketio.emit("joined", {"status": "error", "reason": "server-error"})
+        
+        # Join room for this exam
+        room = f"exam_{exam_id}"
+        join_room(room)
+        
+        if role == 'student':
+            # Find or create exam session
+            session = ExamSession.query.filter_by(
+                exam_id=exam_id,
+                user_id=user_id,
+                status='in_progress'
+            ).first()
+            
+            if session:
+                # Store active session
+                active_sessions[session.id] = {
+                    'user_id': user_id,
+                    'exam_id': exam_id,
+                    'socket_id': request.sid,
+                    'role': role
+                }
+                
+                emit('joined_exam', {
+                    'message': 'Joined exam successfully',
+                    'session_id': session.id,
+                    'exam_id': exam_id
+                })
+                
+                # Notify proctors
+                emit('student_joined', {
+                    'user_id': user_id,
+                    'exam_id': exam_id,
+                    'session_id': session.id
+                }, room=room, skip_sid=request.sid)
+        else:
+            # Proctor joined
+            emit('joined_exam', {
+                'message': 'Joined exam as proctor',
+                'exam_id': exam_id
+            })
+        
+    except Exception as e:
+        print(f"Error in join_exam: {e}")
+        emit('error', {'message': str(e)})
 
-# client emits: socket.emit("behavior_event", {user_id, exam_id, event_type, payload})
-@socketio.on("behavior_event")
-def handle_behavior_event(data):
+
+@socketio.on('leave_exam')
+def handle_leave_exam(data):
+    """Leave an exam room"""
+    try:
+        exam_id = data.get('exam_id')
+        if exam_id:
+            room = f"exam_{exam_id}"
+            leave_room(room)
+            emit('left_exam', {'message': 'Left exam successfully'})
+    except Exception as e:
+        print(f"Error in leave_exam: {e}")
+        emit('error', {'message': str(e)})
+
+
+@socketio.on('suspicious_activity')
+def handle_suspicious_activity(data):
     """
-    Persist event, compute risk, optionally create alert and emit to proctors.
+    Log suspicious activity during exam
+    
+    Data: {user_id, exam_id, type, count, duration, etc.}
     """
     try:
-        # Basic validation/coercion
-        user_id = int(data.get("user_id"))
-        exam_id = int(data.get("exam_id"))
-        event_type = str(data.get("event_type", "unknown"))
-        payload = data.get("payload", {}) or {}
-
-        # Persist event to DB
-        ev = Event(user_id=user_id, exam_id=exam_id, event_type=event_type, payload=payload)
-        db.session.add(ev)
-        db.session.commit()
-
-        # Run risk engine (uses baseline if available)
-        try:
-            baseline = Baseline.query.filter_by(user_id=user_id).first()
-        except Exception:
-            baseline = None
-
-        # compute_risk_score should return float between 0 and 1 and a dictionary of reasons/metrics
-        risk_score, reasons = compute_risk_score(event_type, payload, baseline)
-
-        # Emit lightweight ack to the client
-        user_room = f"exam_{exam_id}_user_{user_id}"
-        socketio.emit("event_received", {"status": "ok", "event_id": ev.id, "risk": risk_score}, to=user_room)
-
-        # If risk passes threshold, create Alert and notify proctors
-        WARNING_THRESHOLD = 0.5
-        FLAG_THRESHOLD = 0.7
-
-        if risk_score >= WARNING_THRESHOLD:
-            alert = Alert(user_id=user_id, exam_id=exam_id, risk_score=risk_score,
-                          reason=";".join(reasons.get("reasons", [])) if reasons else "rule-trigger",
-                          meta={"event_type": event_type, "payload": payload, "reasons": reasons})
-            db.session.add(alert)
-            db.session.commit()
-
-            proctor_room = f"exam_{exam_id}_proctors"
-            payload_out = {
-                "alert_id": alert.id,
-                "user_id": user_id,
-                "exam_id": exam_id,
-                "risk_score": float(risk_score),
-                "reason": alert.reason,
-                "meta": alert.meta
+        user_id = data.get('user_id')
+        exam_id = data.get('exam_id')
+        event_type = data.get('type')
+        
+        if not all([user_id, exam_id, event_type]):
+            emit('error', {'message': 'Missing required fields'})
+            return
+        
+        # Find active session
+        session = ExamSession.query.filter_by(
+            exam_id=exam_id,
+            user_id=user_id,
+            status='in_progress'
+        ).first()
+        
+        if not session:
+            emit('error', {'message': 'No active session found'})
+            return
+        
+        # Determine severity
+        severity = 'low'
+        if event_type in ['copy_paste', 'tab_switch'] and data.get('count', 0) > 3:
+            severity = 'high'
+        elif event_type == 'window_blur' and data.get('duration', 0) > 30:
+            severity = 'medium'
+        
+        # Create event
+        event = Event(
+            session_id=session.id,
+            event_type=event_type,
+            event_data=json.dumps(data),
+            timestamp=datetime.utcnow(),
+            severity=severity
+        )
+        db.session.add(event)
+        
+        # Update incident count
+        session.flagged_incidents_count += 1
+        
+        # Calculate risk score
+        baseline = Baseline.query.filter_by(user_id=user_id).first()
+        if baseline:
+            events = Event.query.filter_by(session_id=session.id).all()
+            current_behavior = {
+                'typing_speed_wpm': data.get('typing_speed_wpm', 0),
+                'mouse_speed_pxs': data.get('mouse_speed_pxs', 0),
+                'avg_question_time_sec': data.get('avg_question_time_sec', 0)
             }
-            # emit to proctors only
-            socketio.emit("alert", payload_out, to=proctor_room)
+            
+            risk_score = risk_scorer.calculate_risk_score(
+                current_behavior,
+                baseline,
+                events
+            )
+            
+            session.risk_score = risk_score
+            session.integrity_score = 1.0 - risk_score
+            
+            # Create alert if risk is high
+            if risk_score > 0.7:
+                alert = Alert(
+                    session_id=session.id,
+                    alert_type=event_type,
+                    message=f"High risk activity detected: {event_type}",
+                    risk_score=risk_score,
+                    severity='high',
+                    resolved=False
+                )
+                db.session.add(alert)
+                
+                # Notify proctors immediately
+                room = f"exam_{exam_id}"
+                emit('high_risk_alert', {
+                    'user_id': user_id,
+                    'session_id': session.id,
+                    'risk_score': risk_score,
+                    'event_type': event_type,
+                    'message': alert.message
+                }, room=room)
+        
+        db.session.commit()
+        
+        # Acknowledge to student
+        emit('activity_logged', {
+            'message': 'Activity logged',
+            'event_type': event_type,
+            'severity': severity
+        })
+        
+        # Notify proctors
+        room = f"exam_{exam_id}"
+        emit('student_activity', {
+            'user_id': user_id,
+            'session_id': session.id,
+            'event_type': event_type,
+            'severity': severity,
+            'risk_score': session.risk_score,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room=room, skip_sid=request.sid)
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in suspicious_activity: {e}")
+        emit('error', {'message': str(e)})
 
-    except Exception:
-        # rollback if needed and log
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-        current_app.logger.error("Error handling behavior_event:\n" + traceback.format_exc())
-        socketio.emit("event_received", {"status": "error", "error": "server-error"})
+
+@socketio.on('submit_exam')
+def handle_submit_exam(data):
+    """Handle exam submission via socket"""
+    try:
+        user_id = data.get('user_id')
+        exam_id = data.get('exam_id')
+        answers = data.get('answers', {})
+        time_taken = data.get('time_taken')
+        
+        # Find session
+        session = ExamSession.query.filter_by(
+            exam_id=exam_id,
+            user_id=user_id,
+            status='in_progress'
+        ).first()
+        
+        if not session:
+            emit('error', {'message': 'No active session found'})
+            return
+        
+        # Update session
+        session.submitted_at = datetime.utcnow()
+        session.time_taken_seconds = time_taken
+        session.answers = json.dumps(answers)
+        session.status = 'submitted'
+        
+        db.session.commit()
+        
+        # Remove from active sessions
+        if session.id in active_sessions:
+            del active_sessions[session.id]
+        
+        emit('exam_submitted', {
+            'message': 'Exam submitted successfully',
+            'session_id': session.id
+        })
+        
+        # Notify proctors
+        room = f"exam_{exam_id}"
+        emit('student_submitted', {
+            'user_id': user_id,
+            'session_id': session.id,
+            'exam_id': exam_id
+        }, room=room)
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error in submit_exam: {e}")
+        emit('error', {'message': str(e)})
+
+
+@socketio.on('get_active_students')
+def handle_get_active_students(data):
+    """Get list of active students in an exam (proctor only)"""
+    try:
+        exam_id = data.get('exam_id')
+        
+        if not exam_id:
+            emit('error', {'message': 'Missing exam_id'})
+            return
+        
+        # Get all active sessions for this exam
+        sessions = ExamSession.query.filter_by(
+            exam_id=exam_id,
+            status='in_progress'
+        ).all()
+        
+        active_students = []
+        for session in sessions:
+            if session.id in active_sessions:
+                student_data = {
+                    'user_id': session.user_id,
+                    'session_id': session.id,
+                    'risk_score': session.risk_score,
+                    'integrity_score': session.integrity_score,
+                    'incidents_count': session.flagged_incidents_count,
+                    'started_at': session.started_at.isoformat()
+                }
+                
+                # Add user info
+                if session.student:
+                    student_data['name'] = session.student.name
+                    student_data['roll_number'] = session.student.roll_number
+                
+                active_students.append(student_data)
+        
+        emit('active_students', {
+            'exam_id': exam_id,
+            'students': active_students,
+            'count': len(active_students)
+        })
+        
+    except Exception as e:
+        print(f"Error in get_active_students: {e}")
+        emit('error', {'message': str(e)})
